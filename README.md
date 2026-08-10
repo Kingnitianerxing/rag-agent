@@ -1,330 +1,186 @@
-# Production RAG System
+# Production RAG
 
-Production-grade Retrieval-Augmented Generation: hybrid retrieval (vector + BM25 + GraphRAG),
-reranking, **grounded & cited generation with refusal**, real token streaming, per-query cost
-tracking, a semantic cache, and a measurable evaluation harness — packaged for one-command
-Docker deployment.
+生产级检索增强问答（RAG）服务：混合检索、有据生成（引用 + 拒答）、Corrective-RAG Agent、JWT 多角色权限与文档分享，以及文本 / 图像双轨检索。
 
-[![CI](https://github.com/WeiGuang-2099/Production-RAG/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/WeiGuang-2099/Production-RAG/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
-![tests](https://img.shields.io/badge/tests-293%20passing-brightgreen)
-![lint](https://img.shields.io/badge/lint-ruff-purple)
+![stack](https://img.shields.io/badge/stack-LangGraph%20%7C%20FastAPI%20%7C%20React-informational)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-> **Built test-first, then measured against real keys.** The eval surfaced 3 bugs 215 mocked
-> tests couldn't, and showed standard RAGAS *penalizes correct refusals* — the wrong yardstick
-> for a cite-or-refuse system. → [Read the case study](docs/CASE_STUDY.md).
+## 特性
 
-## Why this project is different
+- **混合检索**：向量（Qdrant）+ BM25（RRF 融合），可选 GraphRAG 扩展与 Cohere 重排序
+- **有据生成**：默认 `grounded` 提示词，回答带 `[n]` 引用；证据不足时拒答
+- **Corrective-RAG Agent**（LangGraph）：路由 → 检索 → 相关性评判 → 查询改写 → 生成；与 `/chat` 共用同一检索与生成核心
+- **JWT + 文档 ACL**：角色 `admin` / `editor` / `viewer`；管理员可按角色或用户分享文档
+- **双轨多模态**：PDF/Markdown 走文本 embedding；图片用 DashScope `qwen3-vl-embedding` 入独立集合并以文搜图；入库生成图像描述供 grounded 回答；与文本结果 RRF 融合
+- **工程化能力**：流式输出、语义缓存（可选 Redis）、Guardrails、限流、健康检查、评测与 Docker 部署
 
-Most RAG demos wire up LangChain and stop. This one is built like a service you would actually
-run and improve:
-
-- **Answers are grounded, cited, and willing to refuse.** The default prompt answers only from
-  retrieved context, cites sources as `[n]`, and replies "I cannot answer this from the provided
-  documents" instead of hallucinating. The eval set includes an `unanswerable` bucket that
-  specifically tests this.
-- **Quality is measured, not asserted.** A retrieval ablation (`baseline → +BM25 → +rerank →
-  +graph`) reports recall@k / MRR / hit@k with no LLM judge, and RAGAS covers end-to-end answer
-  quality. See [Evaluation](#evaluation).
-- **Real production concerns are handled**: token streaming, per-query token/cost accounting,
-  a semantic cache, bearer-token auth, rate limiting, structured JSON logging with request IDs,
-  health/readiness probes, path-traversal-safe ingestion, and graceful degradation when a
-  component fails.
-- **Guardrails at the API edge.** Inputs are screened for prompt injection (blocked with
-  `400`) and answers are scanned for PII (redacted) and toxicity (flagged) before they leave
-  `/chat` and `/agent` — heuristic detectors (regex / wordlist, no heavy framework), toggled by
-  `GUARDRAILS_ENABLED`. On the streaming endpoints the final answer is guarded, not each token.
-- **Provider-agnostic by construction.** Config-driven factories pick the LLM / embedder /
-  reranker; there is no `if provider == ...` scattered through the business logic.
-- **Task-based model routing with fallback.** The agent's control-plane calls (route / grade /
-  rewrite) run on a cheap fast model while answer generation uses the strong model, and any LLM
-  call falls back to a same-provider model on error or timeout. Tuned via `LLM_MODEL_FAST` /
-  `LLM_FALLBACK_MODEL` / `LLM_TIMEOUT`.
-
-## Architecture
+## 架构
 
 ```mermaid
-flowchart LR
-    subgraph Ingest
-        A[PDF / Markdown / URL] --> B[Loader]
-        B --> C[Token-aware chunker]
-        C --> D[Embedder]
-        D --> E[(Qdrant vectors)]
-        C --> F[(BM25 index)]
-        C --> G[LLM / NLP triple extractor] --> H[(NetworkX graph)]
-    end
+flowchart TB
+  subgraph ingest [Ingest]
+    PDF[PDF_MD_URL] --> TextEmb[Text embedding]
+    TextEmb --> ColText[(Qdrant rag_docs)]
+    PDF --> BM25[(BM25)]
+    PDF --> Graph[(Knowledge graph)]
+    IMG[PNG_JPG_WEBP] --> Cap[VL caption]
+    IMG --> VLEmb[qwen3-vl-embedding]
+    Cap --> GenCtx[Grounded context]
+    VLEmb --> ColImg[(Qdrant rag_images)]
+  end
 
-    subgraph Query
-        Q[Question] --> K{Semantic cache?}
-        K -- hit --> ANS[Answer + sources + usage]
-        K -- miss --> QT[Query transform<br/>none / multi-query / HyDE]
-        QT --> VS[Vector search]
-        QT --> BM[BM25 search]
-        VS --> RRF[RRF fusion]
-        BM --> RRF
-        GE[Graph expand] --> MG[Merge]
-        RRF --> MG
-        MG --> RR[Cohere rerank]
-        RR --> GEN[Grounded generation<br/>cite + refuse + stream]
-        GEN --> ANS
-    end
-
-    E -.-> VS
-    F -.-> BM
-    H -.-> GE
+  subgraph query [Query]
+    Q[Question] --> Auth[JWT ACL scope]
+    Auth --> Hybrid[Vector + BM25 RRF]
+    Auth --> ImgSearch[VL text-to-image]
+    Hybrid --> ColText
+    ImgSearch --> ColImg
+    ColText --> Fuse[RRF merge]
+    ColImg --> Fuse
+    Fuse --> Answer[Grounded generate]
+  end
 ```
 
-- **Ingest**: Loaders (PDF/MD/Web) → token-aware chunker → embedder → Qdrant + BM25 + knowledge graph
-- **Query**: condense follow-up (history-aware, fast model) → cache → query transform → vector + keyword hybrid (RRF; pluggable keyword store: local BM25 or OpenSearch) → GraphRAG expand → rerank → grounded LLM generation
-- **Config**: all behavior via `.env`, provider-agnostic factories
-- **Observability**: LangSmith tracing + per-query token/cost logging
+## 快速开始（Windows 本地）
 
-## Quick start
+前置：Python 3.11+、Node.js、本机 Qdrant（`:6333`）。
+
+```powershell
+# 1. 配置
+copy .env.example .env
+# 填写 LLM / Embedding Key；图像轨需 DASHSCOPE_API_KEY + IMAGE_RETRIEVAL_ENABLED=true
+# 鉴权示例：AUTH_ENABLED=true，并设置 JWT_SECRET 与 BOOTSTRAP_ADMIN_*
+
+# 2. 安装依赖
+pip install -e ".[dev]"
+cd frontend; npm install; cd ..
+
+# 3. 启动（另开终端跑 Qdrant 后）
+.\scripts\start.ps1
+# 前端 http://127.0.0.1:5173  ·  API http://127.0.0.1:8000
+
+# 停止
+.\scripts\stop.ps1
+```
+
+也可用 Docker：
 
 ```bash
-# 1. Configure
-cp .env.example .env          # add your OpenAI + Cohere keys
-
-# 2. Start API + Qdrant
+cp .env.example .env   # 填入密钥
 docker-compose up -d
-
-# 3. Ingest a document (must live under DATA_DIR)
-curl -X POST http://localhost:8000/ingest \
-  -H "Content-Type: application/json" \
-  -d '{"source": "./data/papers/attention.pdf"}'
-
-# 4. Ask a question (streaming)
-curl -N -X POST http://localhost:8000/chat/stream \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What does the Transformer eliminate?"}'
 ```
 
 ## Demo UI
 
-A React single-page app (Vite + TypeScript) in `frontend/` exposes the full system: chat with live
-token streaming and cited sources (persisted across navigation and reload), a per-document scope
-picker that restricts retrieval to the selected files, agentic mode with a visible reasoning
-trace, document upload/listing/deletion, and an architecture overview.
+`frontend/` 为 Vite + React + TypeScript SPA：
+
+- 登录 / 登出（JWT）
+- Chat / Agent 流式问答与引用
+- 文档上传（PDF / Markdown / 图片）、列表、删除
+- 管理员分享文档（按角色或用户）
+- 文档范围选择（限制检索语料）
 
 ```bash
 cd frontend
-cp .env.example .env        # set VITE_API_URL to your backend (default http://localhost:8000)
 npm install
-npm run dev                 # http://localhost:5173
-
-npm run build               # static assets in frontend/dist for Vercel/Netlify
+npm run dev    # http://localhost:5173
 ```
 
-The SPA calls the backend directly, so set the backend's `CORS_ORIGINS` to the SPA origin
-(`http://localhost:5173` in dev). For an open public demo, run the backend with `API_KEY_HASH`
-unset.
+将后端 `CORS_ORIGINS` 设为前端源（默认含 `http://localhost:5173`）。
 
-**Chat** — grounded answer with `[n]` citations and expandable source chunks (including a
-knowledge-graph hit):
+## 鉴权与 ACL
 
-![Chat workbench: grounded, cited answers with a linked source inspector](docs/screenshots/chat.png)
+| 角色 | 能力 |
+|------|------|
+| `admin` | 全部语料；上传 / 删除；分享文档 |
+| `editor` | 上传；读写自己的文档及被分享的文档 |
+| `viewer` | 只读自己的文档及被分享的文档（无上传） |
 
-**Agent mode** — the corrective-RAG trace (`route → retrieve → grade → generate`) is shown above
-the answer, with per-query token and cost accounting below it:
+关键配置（`.env`）：
 
-![Agent mode: corrective-RAG trace with token and cost accounting as metric chips](docs/screenshots/agent.png)
-
-## Evaluation
-
-Evaluation is **numbers, not adjectives** — and the story behind the numbers is the
-[**case study**](docs/CASE_STUDY.md): what running the harness against real keys actually taught
-me, including three production bugs 215 mocked tests missed and why standard RAGAS scores a
-cite-or-refuse system *backwards*. **Start there.**
-
-The corpus is 6 classic ML papers from arXiv and the dataset is 48 hand-written questions across
-6 types (factual, multi-hop, comparative, numerical, unanswerable, long-tail); the harness itself
-is documented in [`evaluation/README.md`](evaluation/README.md).
-
-```bash
-python evaluation/corpus/download_papers.py        # fetch the 6 papers
-# ingest them (loop in evaluation/README.md), then:
-
-# Cheap, deterministic retrieval ablation (no LLM judge):
-python evaluation/run_ablation.py --k 5
-
-# End-to-end RAGAS, comparing the grounded vs basic prompt:
-PROMPT_MODE=basic    python evaluation/run_eval.py --label basic
-PROMPT_MODE=grounded python evaluation/run_eval.py --label grounded
+```env
+AUTH_ENABLED=true
+JWT_SECRET=your-long-random-secret
+BOOTSTRAP_ADMIN_USERNAME=admin
+BOOTSTRAP_ADMIN_PASSWORD=change-me
 ```
 
-Real results (2026-06-22, 6-paper corpus, 479 chunks) — full breakdown and honest
-interpretation in [`evaluation/results/`](evaluation/results/README.md).
+- `POST /auth/login` 获取 JWT  
+- `PATCH /ingest/documents/{id}/share` 管理员设置 `allowed_roles` / `allowed_user_ids`  
+- `AUTH_ENABLED=true` 时 MCP 工具关闭（无用户上下文，防止绕过 ACL）
 
-**Retrieval ablation** — recall@5 over the reranked top-5; latency is retrieval-only
-(includes the per-query embedding call):
+## 图像检索（双轨）
 
-| stage | recall@5 | mrr | hit@5 | p50_ms | p95_ms |
-| --- | --- | --- | --- | --- | --- |
-| baseline (dense)    | 0.934 | 0.979 | 1.000 | 1133 | 1783 |
-| +bm25 (hybrid RRF)  | **0.972** | 0.958 | 1.000 | 1039 | 1640 |
-| +rerank (Cohere)    | 0.962 | **0.979** | 1.000 | 1747 | 2067 |
-| +graph              | 0.903 | 0.927 | 0.958 | 1773 | 2185 |
+```env
+DASHSCOPE_API_KEY=sk-xxx
+IMAGE_RETRIEVAL_ENABLED=true
+VL_EMBEDDING_MODEL=qwen3-vl-embedding
+VL_EMBEDDING_DIMENSION=1024
+VL_COLLECTION_NAME=rag_images
+VL_CAPTION_MODEL=qwen-vl-plus
+```
 
-Honest read: on six topically distinct papers dense retrieval is already
-near-ceiling (baseline hit@5 = 1.000), so the ablation measures *which knob moves
-what*. **+BM25 maximizes recall@5** (0.934 → 0.972, no latency cost) but its RRF
-reshuffle nudges MRR to 0.958; **+rerank trades a hair of recall (0.962) to restore
-MRR to 0.979** — the single best chunk first — for ~0.7s of added p95; **+graph
-actively hurts here** (recall 0.903, hit@5 0.958), as cross-paper expansion adds
-noise on a small, well-separated corpus. So the hybrid+rerank defaults are
-justified and graph is honestly flagged as not paying off at this scale.
+| 轨 | 入库 | 检索 |
+|----|------|------|
+| 文本 | text embedding → `rag_docs` + BM25 / Graph | 混合检索 |
+| 图像 | 原图 VL embedding → `rag_images`；caption 作回答上下文 | 以文搜图，再与文本结果 RRF 融合 |
 
-**Scale robustness** — a second corpus adds 24 *adversarial* distractor papers
-(RoBERTa/ALBERT vs BERT, DPR/FiD vs RAG, QLoRA vs LoRA, ...), growing the index
-4.6x to 2,194 chunks with the same 48 questions. Recall holds (0.934, hit@5
-1.000) but **ranking degrades** (MRR 0.979 → 0.844) — and the reranker becomes
-the highest-value component, roughly doubling its MRR contribution while BM25's
-recall edge nearly vanishes. Paired tables and the honest read in
-[`evaluation/results/`](evaluation/results/README.md).
+支持格式：`.png` / `.jpg` / `.jpeg` / `.webp`。
 
-**Latency** — caching the stores (Qdrant connection, BM25 index, graph) and running the
-retrieval legs in parallel is score-neutral by construction (identical RRF inputs; verified
-per stage on both corpora) and roughly halves retrieval latency across the board — p50
-~1.4s → ~0.64s for the full pipeline, with p95 down up to 2.5x. The per-query BM25 unpickle
-grew with the corpus, so store caching also removes a scaling liability. Repeat questions
-short-circuit through the semantic cache (Redis-backed when `REDIS_URL` is set) in ~0.2s:
-before/after p50/p95 tables in [`evaluation/results/`](evaluation/results/README.md).
+## API 摘要
 
-**Keyword backend** — swapping the local `rank_bm25` store for OpenSearch (standard analyzer)
-tests whether the naive `lower().split()` tokenization caused BM25's vanishing recall edge at
-30-paper scale: it did not — the edge stays gone (+0.007 local vs +0.000 OpenSearch over the
-dense baseline), so the vanishing edge is a property of the corpus at scale, not a tokenization
-artifact. Paired local-vs-OpenSearch tables in
-[`evaluation/results/`](evaluation/results/README.md).
+| Method | Path | 说明 |
+|--------|------|------|
+| POST | `/auth/login` | 登录，返回 JWT |
+| GET | `/auth/me` | 当前用户 |
+| GET | `/auth/users` | 用户列表（admin，用于分享） |
+| POST | `/chat` · `/chat/stream` | 问答（可选 `sources` / `history`） |
+| POST | `/agent` · `/agent/stream` | Corrective-RAG Agent |
+| POST | `/ingest` · `/ingest/upload` | 入库（文件 / URL / 上传） |
+| GET | `/ingest/documents` | 文档列表（按 ACL 过滤） |
+| PATCH | `/ingest/documents/{id}/share` | 分享 ACL（admin） |
+| DELETE | `/ingest/documents/{id}` | 删除记录 |
+| GET | `/health/live` · `/health/ready` | 健康检查 |
 
-**Multi-turn** — follow-up questions with pronouns ("what about its training cost?") used to
-retrieve against the raw text and miss. A fast-model condense-question step now rewrites them
-into standalone questions before the cache and retrieval — generation never sees the history, so
-the cite-or-refuse contract stays single-turn. Measured on 18 hand-written follow-ups:
-recall@5 0.778 raw -> 1.000 condensed (hand-written oracle 1.000), 846 ms p50 added
-per follow-up turn. Three-condition table in
-[`evaluation/results/`](evaluation/results/README.md).
+## 主要配置
 
-End-to-end (RAGAS, grounded vs basic), the result is more interesting than the
-cliche: the grounded prompt **refuses 5/5 unanswerable questions** (basic 0/5),
-yet standard RAGAS faithfulness/relevancy *penalize* that correct refusal — a
-real measurement pitfall for cite-or-refuse systems that the
-[results page](evaluation/results/README.md) digs into.
+完整列表见 [`.env.example`](.env.example)。
 
-## Development
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `PROMPT_MODE` | grounded | grounded（引用+拒答）/ basic |
+| `RETRIEVAL_MODE` | hybrid | hybrid / dense |
+| `RERANKER_PROVIDER` | cohere | cohere / none |
+| `CACHE_ENABLED` | false | 语义缓存 |
+| `REDIS_URL` | 空 | 空则进程内缓存 |
+| `AUTH_ENABLED` | false | JWT + ACL |
+| `IMAGE_RETRIEVAL_ENABLED` | false | 图像双轨 |
+| `GUARDRAILS_ENABLED` | true | 注入拦截 / PII / 毒性 |
+
+## 开发与评测
 
 ```bash
 pip install -e ".[dev]"
 ruff check .
-pytest -q                                  # 293 tests, all mocked (no services needed)
-pytest --cov=app --cov-report=term-missing
+pytest -q
+
+# 评测说明与结果
+# evaluation/README.md  ·  docs/CASE_STUDY.md
 ```
 
-## Configuration
+## 技术栈
 
-All via `.env` (see `.env.example` for the full annotated list).
+Python 3.11+、FastAPI、LangChain / LangGraph、React (Vite)、Qdrant、rank_bm25、DashScope（多模态）、SQLite（用户与 ACL）、可选 Redis / OpenSearch / Cohere Rerank、Docker Compose。
 
-| Variable | Default | Description |
-|---|---|---|
-| `LLM_PROVIDER` / `LLM_MODEL` | openai / gpt-4o | Chat model (openai / anthropic) |
-| `LLM_MODEL_FAST` | gpt-4o-mini | Cheap model for agent control-plane calls (route / grade / rewrite) |
-| `LLM_FALLBACK_MODEL` | gpt-4o-mini | Same-provider fallback on error/timeout (empty = disabled) |
-| `LLM_TIMEOUT` | 30 | LLM request timeout in seconds |
-| `EMBEDDING_MODEL` | text-embedding-3-small | Embedding model |
-| `RERANKER_PROVIDER` | cohere | cohere / none |
-| `PROMPT_MODE` | grounded | grounded (cite + refuse) / basic |
-| `RETRIEVAL_MODE` | hybrid | hybrid (vector + BM25 RRF) / dense |
-| `QUERY_TRANSFORM` | none | none / multi_query / hyde |
-| `GRAPH_EXTRACTOR` | llm | llm / nlp / none |
-| `CACHE_ENABLED` | false | semantic short-circuit cache |
-| `REDIS_URL` | - | Redis backend for the semantic cache (empty = in-process; falls back on error) |
-| `KEYWORD_BACKEND` | local | keyword store: local (rank_bm25, zero-dep) / opensearch (incremental, shared) |
-| `OPENSEARCH_URL` / `OPENSEARCH_INDEX` | localhost:9200 / rag_chunks | OpenSearch endpoint and index name |
-| `HISTORY_CONDENSE_ENABLED` | true | rewrite follow-ups into standalone questions using chat history (fast model) |
-| `CHAT_HISTORY_MAX_TURNS` / `CHAT_HISTORY_MAX_TURN_CHARS` | 10 / 2000 | server-side history trimming caps |
-| `CHUNK_SIZE` / `CHUNK_OVERLAP` | 512 / 64 | token-based chunking |
-| `TOP_K` / `RERANK_TOP_K` | 5 / 5 | retrieval depth / final context size |
-| `API_KEY_HASH` | - | SHA256 of bearer token (empty = open) |
-| `GUARDRAILS_ENABLED` | true | edge guardrails: prompt-injection block + PII redaction + toxicity flag |
-| `MCP_ALLOW_INGEST` | true | expose the ingest (write) tool over the MCP server |
-| `LANGSMITH_TRACING` | false | enable LangSmith tracing |
+## 设计说明
 
-## API
+- **有据生成优先**：宁可拒答，也不编造；评测见 `docs/CASE_STUDY.md`
+- **图像回答依赖入库 caption**：检索匹配图像向量，生成阅读描述文本（非每次提问重跑视觉模型）
+- **双轨向量空间分离**：文本与图像 embedding 模型不同；跨轨用排名 RRF 融合，不直接比原始分数
+- **GraphRAG 偏轻量**：实体匹配为词法级，小规模语料上收益有限
+- **多轮问答**：用 fast 模型将追问压缩为独立问题后再检索，生成侧不直接吃完整历史
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/chat` | Answer with sources + token/cost usage; optional `sources` scopes retrieval, optional `history` condenses follow-ups |
-| POST | `/chat/stream` | Token-by-token NDJSON stream |
-| POST | `/agent` | Corrective-RAG agent answer with trace (route / steps / attempts); accepts `sources` and `history` too |
-| POST | `/agent/stream` | Agent answer as an NDJSON stream |
-| POST | `/ingest` | Ingest a PDF/Markdown file (under `DATA_DIR`) or URL |
-| POST | `/ingest/upload` | Upload a PDF/Markdown file (multipart) and ingest it |
-| GET | `/ingest/documents` | List ingested documents |
-| DELETE | `/ingest/documents/{id}` | Remove an ingestion record |
-| GET | `/health/live` · `/health/ready` | Liveness / readiness probes |
+## License
 
-## MCP server
-
-The same RAG engine is also exposed over the [Model Context Protocol](https://modelcontextprotocol.io)
-(stdio, FastMCP), so MCP clients like Claude Desktop can drive it directly — no HTTP. It reuses the
-pipeline, the corrective-RAG agent, and the guardrails in-process.
-
-What it exposes:
-
-- **Tools** — `search` (cited snippets, no generation), `ask` (corrective-RAG agent answer with
-  citations), `ingest` (add a file/URL; gated by `MCP_ALLOW_INGEST`), `list_documents`.
-- **Resource** — `rag://documents` (the ingested corpus as JSON).
-- **Prompt** — `grounded_research` (a template that drives the tools toward a cited answer).
-
-Run it (Qdrant must be running and a populated `.env` present, same config as the HTTP API):
-
-```bash
-pip install -e .          # exposes the `rag-mcp` console script
-rag-mcp                   # or: python -m app.mcp_server
-```
-
-Wire it into Claude Desktop's `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "production-rag": {
-      "command": "/path/to/.venv/bin/python",
-      "args": ["-m", "app.mcp_server"],
-      "cwd": "/path/to/production-rag"
-    }
-  }
-}
-```
-
-(`cwd` lets the server find `.env`; alternatively pass the keys via an `"env"` block. On Windows use
-the `\.venv\Scripts\python.exe` interpreter path.)
-
-<!-- ![mcp](docs/mcp-claude-desktop.png) -->
-
-## Tech stack
-
-Python 3.11+, FastAPI, LangChain 0.3+, Qdrant (vectors), rank_bm25 / OpenSearch (keyword, pluggable), NetworkX (graph),
-Cohere Rerank, tiktoken (token/cost accounting), RAGAS (eval), LangSmith (tracing), Docker Compose.
-
-## Design notes & limitations
-
-Deliberate trade-offs in the current implementation:
-
-- **GraphRAG is intentionally lightweight.** Triples come from an LLM/NER pass and entity
-  matching is lexical (n-gram + substring). It helps multi-hop questions but is not a full
-  community-detection GraphRAG; that is the most natural next iteration.
-- **The semantic cache is Redis-backed when `REDIS_URL` is set** (survives restarts, shared
-  across replicas) and falls back to an in-process cache when Redis is absent or down. The
-  semantic scan is linear over a 256-entry FIFO window — RediSearch KNN is the natural upgrade
-  if the cache grows.
-- **The keyword store is pluggable: local `rank_bm25` (default, zero-dep) or OpenSearch
-  (`KEYWORD_BACKEND=opensearch`).** The local store rebuilds its index on each ingest — fine at
-  demo scale; the OpenSearch backend indexes incrementally, shares state across processes, and
-  removes the scale ceiling. A dead OpenSearch degrades the keyword leg to vector-only results.
-- **Multi-turn is condense-only: generation never sees the history.** Follow-ups are rewritten
-  into standalone questions by a fast model; facts can only come from retrieved context, so the
-  cite-or-refuse contract stays single-turn and auditable. Rewrite-type follow-ups ("explain that
-  more simply") condense poorly — a documented trade-off, not a bug.
-- **Cost figures are estimates** from a static price table, not billed usage.
+MIT
