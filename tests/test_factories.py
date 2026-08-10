@@ -290,3 +290,13 @@ def test_get_graph_store_cached(tmp_path):
         g2 = get_graph_store()
         assert g1 is g2
     clear_caches()
+
+def test_message_text_strips_anthropic_thinking_blocks():
+    from app.core.factories import message_text
+
+    assert message_text("hello") == "hello"
+    assert message_text([
+        {"type": "thinking", "thinking": "plan"},
+        {"type": "text", "text": "PONG"},
+    ]) == "PONG"
+    assert message_text(None) == ""

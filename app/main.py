@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -8,6 +9,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.api.deps import limiter
 from app.api.routes_agent import router as agent_router
+from app.api.routes_auth import router as auth_router
 from app.api.routes_chat import router as chat_router
 from app.api.routes_ingest import router as ingest_router
 from app.config import get_settings
@@ -19,7 +21,16 @@ logger = logging.getLogger(__name__)
 setup_logging()
 setup_tracing()
 
-app = FastAPI(title="Production RAG", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    from app.auth.db import init_db
+
+    init_db()
+    yield
+
+
+app = FastAPI(title="Production RAG", version="0.2.0", lifespan=lifespan)
 
 # ── Middleware ──────────────────────────────────────────
 settings = get_settings()
@@ -31,7 +42,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
     allow_credentials="*" not in cors_origins,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
     expose_headers=["X-Request-ID"],
 )
@@ -49,6 +60,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 
 # ── Routes ─────────────────────────────────────────────
+app.include_router(auth_router)
 app.include_router(ingest_router)
 app.include_router(chat_router)
 app.include_router(agent_router)

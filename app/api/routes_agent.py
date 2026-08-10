@@ -8,12 +8,16 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.agent.graph import run_agent, stream_agent
-from app.api.deps import limiter, verify_api_key
+from app.api.deps import get_current_user, limiter
+from app.auth.acl import effective_sources, resolve_allowed_sources
+from app.auth.models import AuthUser
 from app.guardrails.service import apply_output, check_input
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["agent"])
+
+_NO_ACCESS_ANSWER = "I cannot answer this from the provided documents."
 
 
 class HistoryTurn(BaseModel):
@@ -39,14 +43,33 @@ class AgentResponse(BaseModel):
     condensed_question: str | None = None
 
 
+def _scoped_sources(user: AuthUser, requested: list[str] | None) -> list[str] | None:
+    return effective_sources(requested, resolve_allowed_sources(user))
+
+
 @router.post("", response_model=AgentResponse)
 @limiter.limit("30/minute")
-async def agent(request: Request, body: AgentRequest, _key=Depends(verify_api_key)):
+async def agent(
+    request: Request, body: AgentRequest, user: AuthUser = Depends(get_current_user)
+):
     blocked = check_input(body.question)
     if blocked:
-        raise HTTPException(status_code=400, detail={"error": "blocked by input guardrails", "patterns": blocked})
+        raise HTTPException(
+            status_code=400, detail={"error": "blocked by input guardrails", "patterns": blocked}
+        )
+    sources = _scoped_sources(user, body.sources)
+    if sources is not None and len(sources) == 0:
+        return AgentResponse(
+            answer=_NO_ACCESS_ANSWER,
+            sources=[],
+            latency_ms=0.0,
+            usage={},
+            route="blocked",
+            attempts=0,
+            guardrails={"pii_redacted": [], "flags": []},
+        )
     history = [t.model_dump() for t in body.history or []]
-    result = await asyncio.to_thread(run_agent, body.question, body.top_k, body.sources, history)
+    result = await asyncio.to_thread(run_agent, body.question, body.top_k, sources, history)
     guarded = apply_output(result["answer"])
     return AgentResponse(
         answer=guarded["answer"],
@@ -62,20 +85,42 @@ async def agent(request: Request, body: AgentRequest, _key=Depends(verify_api_ke
 
 @router.post("/stream")
 @limiter.limit("30/minute")
-async def agent_stream(request: Request, body: AgentRequest, _key=Depends(verify_api_key)):
+async def agent_stream(
+    request: Request, body: AgentRequest, user: AuthUser = Depends(get_current_user)
+):
     blocked = check_input(body.question)
     if blocked:
-        raise HTTPException(status_code=400, detail={"error": "blocked by input guardrails", "patterns": blocked})
+        raise HTTPException(
+            status_code=400, detail={"error": "blocked by input guardrails", "patterns": blocked}
+        )
 
+    sources = _scoped_sources(user, body.sources)
     history = [t.model_dump() for t in body.history or []]
 
     async def event_generator():
+        if sources is not None and len(sources) == 0:
+            yield json.dumps({"event": "sources", "sources": []}) + "\n"
+            yield json.dumps(
+                {
+                    "event": "done",
+                    "answer": _NO_ACCESS_ANSWER,
+                    "usage": {},
+                    "latency_ms": 0.0,
+                    "route": "blocked",
+                    "attempts": 0,
+                    "guardrails": {"pii_redacted": [], "flags": []},
+                }
+            ) + "\n"
+            return
         try:
-            async for event in stream_agent(body.question, body.top_k, body.sources, history):
+            async for event in stream_agent(body.question, body.top_k, sources, history):
                 if event.get("event") == "done":
                     g = apply_output(event.get("answer", ""))
                     event["answer"] = g["answer"]
-                    event["guardrails"] = {"pii_redacted": g["pii_redacted"], "flags": g["flags"]}
+                    event["guardrails"] = {
+                        "pii_redacted": g["pii_redacted"],
+                        "flags": g["flags"],
+                    }
                 yield json.dumps(event) + "\n"
         except Exception as exc:  # noqa: BLE001
             logger.error("agent stream error: %s", exc)

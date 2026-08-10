@@ -18,15 +18,18 @@ from app.core.factories import (
     complete_with_model,
     get_embedder,
     get_graph_store,
+    get_image_vector_store,
     get_keyword_store,
     get_llm,
     get_reranker,
     get_vector_store,
+    image_retrieval_ready,
 )
 from app.core.prompts import format_context, select_prompt
 from app.graph.builder import GraphBuilder
 from app.ingestion.chunkers import chunk_documents
 from app.ingestion.loaders import load_documents
+from app.ingestion.validation import IMAGE_SUFFIXES
 from app.observability.cost import usage_for
 from app.observability.tracing import trace_retrieval
 from app.reranker.reranker import RerankerService
@@ -38,7 +41,7 @@ logger = logging.getLogger(__name__)
 # Outer retrieval pool: per-query hybrid/dense tasks + the graph leg. The
 # hybrid legs themselves run on hybrid_retriever._leg_executor — a separate
 # pool, so an outer task waiting on legs can never deadlock this one.
-_retrieval_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="retrieval")
+_retrieval_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="retrieval")
 
 # ── Ingestion tracking helpers ──────────────────────────
 
@@ -63,14 +66,53 @@ def _save_tracking(data_dir: str, tracking: dict) -> None:
 def list_documents() -> list[dict]:
     tracking = _load_tracking(get_settings().DATA_DIR)
     return [
-        {"id": k, "source": v["source"], "chunks": v["chunks"], "ingested_at": v.get("ingested_at", "")}
+        {
+            "id": k,
+            "source": v["source"],
+            "chunks": v["chunks"],
+            "ingested_at": v.get("ingested_at", ""),
+            "modality": v.get("modality", "text"),
+        }
         for k, v in tracking.items()
     ]
 
 
+def _record_ingestion(
+    tracking: dict,
+    source_hash: str,
+    source: str,
+    chunks: int,
+    owner_id: int | None,
+    modality: str,
+    elapsed: float,
+) -> dict:
+    tracking[source_hash] = {
+        "source": source,
+        "chunks": chunks,
+        "ingested_at": datetime.now(timezone.utc).isoformat(),
+        "modality": modality,
+    }
+    _save_tracking(get_settings().DATA_DIR, tracking)
+    if owner_id is not None and owner_id > 0:
+        try:
+            from app.auth.db import upsert_document_acl
+
+            upsert_document_acl(source_hash, source, owner_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("document_acl_failed: %s", exc)
+    logger.info(
+        "ingest_complete: source=%s chunks=%d modality=%s latency_ms=%.1f",
+        source,
+        chunks,
+        modality,
+        elapsed,
+    )
+    return {"source": source, "chunks": chunks, "status": "ingested"}
+
+
 # ── Ingest Pipeline ─────────────────────────────────────
 
-def ingest_pipeline(source: str, force: bool = False) -> dict:
+def ingest_pipeline(source: str, force: bool = False, owner_id: int | None = None) -> dict:
     settings = get_settings()
     start = time.time()
     logger.info("ingest_start: source=%s", source)
@@ -93,6 +135,28 @@ def ingest_pipeline(source: str, force: bool = False) -> dict:
     except Exception as exc:
         logger.error("document_load_failed: source=%s error=%s", source, exc)
         raise
+
+    is_image = (
+        Path(source).suffix.lower() in IMAGE_SUFFIXES
+        or any(d.metadata.get("modality") == "image" for d in documents)
+    )
+
+    # Image track: qwen3-vl-embedding → rag_images (skip BM25 / graph)
+    if is_image:
+        if not image_retrieval_ready():
+            raise ValueError(
+                "Image ingestion requires IMAGE_RETRIEVAL_ENABLED=true and DASHSCOPE_API_KEY"
+            )
+        try:
+            get_image_vector_store().upsert(documents)
+            logger.info("image_vector_upserted: count=%d", len(documents))
+        except Exception as exc:
+            logger.error("image_vector_upsert_failed: %s", exc)
+            raise
+        elapsed = (time.time() - start) * 1000
+        return _record_ingestion(
+            tracking, source_hash, source, len(documents), owner_id, "image", elapsed
+        )
 
     # Chunk documents
     chunks = chunk_documents(documents, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
@@ -129,17 +193,10 @@ def ingest_pipeline(source: str, force: bool = False) -> dict:
             logger.error("graph_extraction_failed: %s", exc)
             # Non-critical: continue without graph
 
-    # Record ingestion
     elapsed = (time.time() - start) * 1000
-    tracking[source_hash] = {
-        "source": source,
-        "chunks": len(chunks),
-        "ingested_at": datetime.now(timezone.utc).isoformat(),
-    }
-    _save_tracking(settings.DATA_DIR, tracking)
-    logger.info("ingest_complete: source=%s chunks=%d latency_ms=%.1f", source, len(chunks), elapsed)
-
-    return {"source": source, "chunks": len(chunks), "status": "ingested"}
+    return _record_ingestion(
+        tracking, source_hash, source, len(chunks), owner_id, "text", elapsed
+    )
 
 
 # ── Query Pipeline ───────────────────────────────────────
@@ -183,6 +240,17 @@ def _retrieve_and_rerank(
     if settings.GRAPH_EXTRACTOR != "none" and not sources:
         graph_future = _retrieval_executor.submit(_graph_retrieve, question)
 
+    image_future = None
+    # Use `is True` so unittest MagicMocks (truthy by default) do not enable this leg.
+    if (
+        getattr(settings, "IMAGE_RETRIEVAL_ENABLED", False) is True
+        and isinstance(getattr(settings, "DASHSCOPE_API_KEY", ""), str)
+        and bool(settings.DASHSCOPE_API_KEY)
+    ):
+        image_future = _retrieval_executor.submit(
+            get_image_vector_store().search, question, top_k, sources
+        )
+
     hybrid_results: list[tuple[Document, float]] = []
     try:
         vs = get_vector_store()
@@ -224,7 +292,44 @@ def _retrieve_and_rerank(
             logger.error("graph_retrieval_failed: %s", exc)
             # Continue without graph results
 
-    all_docs = [doc for doc, _ in hybrid_results] + graph_docs
+    image_hits: list[tuple[Document, float]] = []
+    if image_future is not None:
+        try:
+            image_hits = image_future.result()
+            logger.info("image_retrieval_complete: hits=%d", len(image_hits))
+        except Exception as exc:
+            logger.error("image_retrieval_failed: %s", exc)
+            # Continue without image results
+
+    # Fuse text/hybrid ranks with image ranks via RRF. Previously images were
+    # appended after hybrid hits and truncated away when RERANKER=none (slice
+    # kept only the first RERANK_TOP_K text chunks).
+    ranked_lists: list[list[tuple[Document, float]]] = []
+    if hybrid_results:
+        ranked_lists.append(hybrid_results)
+    if image_hits:
+        ranked_lists.append(image_hits)
+    if len(ranked_lists) == 0:
+        fused_docs: list[Document] = []
+    elif len(ranked_lists) == 1:
+        fused_docs = [doc for doc, _ in ranked_lists[0]]
+    else:
+        # Keep a wider pool for the reranker; final cut is RERANK_TOP_K.
+        pool_k = max(top_k * 2, settings.RERANK_TOP_K, top_k + len(image_hits))
+        fused_docs = [doc for doc, _ in rrf_fuse(ranked_lists)[:pool_k]]
+
+    # Prefer keeping at least one image hit in the candidate pool when present.
+    if image_hits:
+        image_sources = {
+            (d.metadata.get("source"), d.page_content) for d, _ in image_hits[:1]
+        }
+        have_image = any(
+            (d.metadata.get("source"), d.page_content) in image_sources for d in fused_docs
+        )
+        if not have_image:
+            fused_docs = [image_hits[0][0]] + fused_docs
+
+    all_docs = fused_docs + graph_docs
 
     # Reranking
     try:
@@ -235,6 +340,13 @@ def _retrieve_and_rerank(
     except Exception as exc:
         logger.warning("rerank_failed: %s — using unranked results", exc)
         reranked = all_docs[: settings.RERANK_TOP_K]
+
+    # If rerank/truncate dropped every image but we had image hits, force-include
+    # the best image so visual questions are not answered from unrelated text only.
+    if image_hits and not any(d.metadata.get("modality") == "image" for d in reranked):
+        best_image = image_hits[0][0]
+        reranked = [best_image, *reranked][: settings.RERANK_TOP_K]
+        logger.info("image_slot_preserved: source=%s", best_image.metadata.get("source"))
 
     return reranked
 
@@ -309,6 +421,7 @@ def query_pipeline(
     top_k: int | None = None,
     sources: list[str] | None = None,
     history: list[dict] | None = None,
+    cache_scope: str = "",
 ) -> dict:
     settings = get_settings()
     if top_k is None:
@@ -328,13 +441,13 @@ def query_pipeline(
         logger.info("condensed: %s -> %s", question[:80], cq.question[:80])
         question = cq.question
 
-    # Scoped queries bypass the cache: cache keys are question-only, so a
-    # cached unscoped answer would leak out-of-scope sources (and vice versa).
+    # Cache keys include cache_scope (user/ACL fingerprint) so answers never
+    # leak across principals. Unscoped admin queries still use scope "".
     cache = _get_query_cache(settings)
-    if cache is not None and not sources:
-        cached = cache.get(question)
+    if cache is not None:
+        cached = cache.get(question, scope=cache_scope)
         if cached is not None:
-            logger.info("cache_hit: question=%s", question[:100])
+            logger.info("cache_hit: question=%s scope=%s", question[:100], cache_scope[:40])
             return attach_condense({**cached, "cached": True}, cq)
 
     reranked = _retrieve_and_rerank(question, top_k, settings, sources=sources)
@@ -374,8 +487,8 @@ def query_pipeline(
         "latency_ms": total_ms,
         "usage": usage,
     }
-    if cache is not None and not sources:
-        cache.put(question, result)
+    if cache is not None:
+        cache.put(question, result, scope=cache_scope)
     return attach_condense(result, cq)
 
 
@@ -384,6 +497,7 @@ async def stream_query(
     top_k: int | None = None,
     sources: list[str] | None = None,
     history: list[dict] | None = None,
+    cache_scope: str = "",
 ) -> AsyncIterator[dict]:
     """Stream a grounded answer token-by-token.
 
@@ -417,10 +531,12 @@ async def stream_query(
 
     context = format_context(reranked)
     prompt_text = select_prompt(settings.PROMPT_MODE).format(context=context, question=question)
+    from app.core.factories import message_text
+
     llm = get_llm()
     parts: list[str] = []
     async for chunk in llm.astream(prompt_text):
-        token = getattr(chunk, "content", "") or ""
+        token = message_text(getattr(chunk, "content", None))
         if token:
             parts.append(token)
             yield {"event": "token", "token": token}

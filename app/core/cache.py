@@ -126,8 +126,13 @@ class QueryCache:
         self.threshold = threshold
         self._backend = backend if backend is not None else InMemoryBackend(max_size)
 
-    def get(self, question: str) -> dict | None:
-        key = _normalize(question)
+    @staticmethod
+    def _key(question: str, scope: str = "") -> str:
+        base = _normalize(question)
+        return f"{scope}::{base}" if scope else base
+
+    def get(self, question: str, scope: str = "") -> dict | None:
+        key = self._key(question, scope)
         entry = self._backend.get(key)
         if entry is not None:
             return entry["result"]
@@ -138,10 +143,15 @@ class QueryCache:
         if not cached_entries:
             return None
 
+        # Semantic match only within the same scope.
         query_vec = self.embed_fn(question)
         best_result = None
         best_sim = self.threshold
         for cached in cached_entries:
+            if scope and cached.get("scope") != scope:
+                continue
+            if not scope and cached.get("scope"):
+                continue
             emb = cached.get("embedding")
             if emb is None:
                 continue
@@ -151,7 +161,9 @@ class QueryCache:
                 best_result = cached["result"]
         return best_result
 
-    def put(self, question: str, result: dict) -> None:
-        key = _normalize(question)
+    def put(self, question: str, result: dict, scope: str = "") -> None:
+        key = self._key(question, scope)
         embedding = self.embed_fn(question) if self.embed_fn is not None else None
-        self._backend.put(key, {"embedding": embedding, "result": result})
+        self._backend.put(
+            key, {"embedding": embedding, "result": result, "scope": scope or ""}
+        )

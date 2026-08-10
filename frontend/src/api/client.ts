@@ -43,6 +43,16 @@ export async function postJson<T>(o: ClientOptions, path: string, body: unknown)
   return (await res.json()) as T;
 }
 
+export async function patchJson<T>(o: ClientOptions, path: string, body: unknown): Promise<T> {
+  const res = await fetch(o.baseUrl + path, {
+    method: "PATCH",
+    headers: authHeaders(o, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new ApiError(res.status, await detailOf(res));
+  return (await res.json()) as T;
+}
+
 export async function del<T>(o: ClientOptions, path: string): Promise<T> {
   const res = await fetch(o.baseUrl + path, { method: "DELETE", headers: authHeaders(o) });
   if (!res.ok) throw new ApiError(res.status, await detailOf(res));

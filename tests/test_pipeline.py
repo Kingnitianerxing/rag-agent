@@ -484,7 +484,15 @@ def test_list_documents_reads_tracking(tmp_path):
         mock_s.return_value.DATA_DIR = str(tmp_path)
         from app.core.pipeline import list_documents
         docs = list_documents()
-        assert docs == [{"id": "h1", "source": "a.pdf", "chunks": 3, "ingested_at": "2026-01-01"}]
+        assert docs == [
+            {
+                "id": "h1",
+                "source": "a.pdf",
+                "chunks": 3,
+                "ingested_at": "2026-01-01",
+                "modality": "text",
+            }
+        ]
 
 
 def test_retrieve_and_rerank_skips_graph_when_scoped(monkeypatch):
@@ -494,6 +502,7 @@ def test_retrieve_and_rerank_skips_graph_when_scoped(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "RETRIEVAL_MODE", "dense", raising=False)
     monkeypatch.setattr(settings, "GRAPH_EXTRACTOR", "nlp", raising=False)
+    monkeypatch.setattr(settings, "IMAGE_RETRIEVAL_ENABLED", False, raising=False)
 
     class _VS:
         def search(self, q, top_k=5, sources=None):
@@ -516,18 +525,34 @@ def test_retrieve_and_rerank_skips_graph_when_scoped(monkeypatch):
     assert called["graph"] is False
 
 
-def test_query_pipeline_bypasses_cache_when_scoped(monkeypatch):
+def test_query_pipeline_cache_isolated_by_scope(monkeypatch):
+    """Scoped lookups must pass cache_scope so ACL/users cannot share hits."""
     import app.core.pipeline as pipe
 
     monkeypatch.setattr(pipe, "_retrieve_and_rerank", lambda *a, **k: [])
     monkeypatch.setattr(pipe, "format_context", lambda docs: "")
     monkeypatch.setattr(pipe, "complete_with_model", lambda prompt: ("answer", "model"))
+    monkeypatch.setattr(pipe, "trace_retrieval", lambda *a, **k: None)
 
-    cache = type("C", (), {"get": lambda self, q: {"answer": "CACHED", "sources": []}, "put": lambda self, q, r: None})()
-    monkeypatch.setattr(pipe, "_get_query_cache", lambda settings: cache)
+    seen = {}
 
-    out = pipe.query_pipeline("q", top_k=3, sources=["only.pdf"])
-    assert out["answer"] == "answer"  # not "CACHED": scoped query must skip the cache
+    class Cache:
+        def get(self, q, scope=""):
+            seen["get"] = (q, scope)
+            # Simulate a hit for a different scope — must not be returned when scope differs
+            if scope == "user-a|*":
+                return {"answer": "CACHED", "sources": [], "latency_ms": 1.0, "usage": {}}
+            return None
+
+        def put(self, q, r, scope=""):
+            seen["put"] = (q, scope)
+
+    monkeypatch.setattr(pipe, "_get_query_cache", lambda settings: Cache())
+
+    out = pipe.query_pipeline("q", top_k=3, sources=["only.pdf"], cache_scope="user-b|only.pdf")
+    assert out["answer"] == "answer"
+    assert seen["get"] == ("q", "user-b|only.pdf")
+    assert seen["put"][1] == "user-b|only.pdf"
 
 
 def test_retrieve_and_rerank_parallel_matches_serial_semantics():
@@ -584,15 +609,16 @@ def test_query_pipeline_threads_condensed_question_through_cache_and_llm():
         result = query_pipeline("follow up?", history=[{"role": "user", "content": "What is X?"}])
 
         mock_cond.assert_called_once_with("follow up?", [{"role": "user", "content": "What is X?"}])
-        fake_cache.get.assert_called_once_with("standalone?")
+        fake_cache.get.assert_called_once_with("standalone?", scope="")
         assert mock_rr.call_args.args[0] == "standalone?"
         prompt = mock_llm.call_args.args[0]
         assert "standalone?" in prompt and "follow up?" not in prompt
         assert result["condensed_question"] == "standalone?"
         assert result["usage"]["condense"] == cond_usage
         # the cached payload stays conversation-free
-        put_key, put_value = fake_cache.put.call_args.args
+        put_key, put_value = fake_cache.put.call_args.args[:2]
         assert put_key == "standalone?"
+        assert fake_cache.put.call_args.kwargs.get("scope", "") == ""
         assert "condensed_question" not in put_value
         assert "condense" not in put_value["usage"]
 
@@ -629,7 +655,7 @@ def test_query_pipeline_cache_hit_carries_condense_transparency():
         from app.core.pipeline import query_pipeline
         result = query_pipeline("f?", history=[{"role": "user", "content": "x"}])
 
-        fake_cache.get.assert_called_once_with("standalone?")
+        fake_cache.get.assert_called_once_with("standalone?", scope="")
         mock_rr.assert_not_called()
         assert result["cached"] is True
         assert result["condensed_question"] == "standalone?"

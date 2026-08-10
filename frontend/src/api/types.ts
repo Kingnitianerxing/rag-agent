@@ -43,6 +43,22 @@ export interface DocumentRecord {
   source: string;
   chunks: number;
   ingested_at: string;
+  modality?: "text" | "image" | string;
+  owner_id?: number | null;
+  allowed_roles?: string[];
+  allowed_user_ids?: number[];
+  can_delete?: boolean;
+  can_share?: boolean;
+}
+export interface AuthUserSummary {
+  id: number;
+  username: string;
+  roles: string[];
+  is_service?: boolean;
+}
+export interface SharePayload {
+  allowed_roles: string[];
+  allowed_user_ids: number[];
 }
 export interface IngestResult {
   source: string;

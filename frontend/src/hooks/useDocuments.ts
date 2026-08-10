@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
-import { ApiError, del, getJson, postJson, uploadFile } from "../api/client";
-import type { DocumentRecord, IngestResult } from "../api/types";
+import { ApiError, del, getJson, patchJson, postJson, uploadFile } from "../api/client";
+import type { DocumentRecord, IngestResult, SharePayload } from "../api/types";
 import { useSettings } from "../context/SettingsContext";
 import { useToast } from "../context/ToastContext";
 
@@ -39,6 +39,30 @@ export function useDocuments() {
     [client, fail, toast],
   );
 
+  const share = useCallback(
+    async (id: string, payload: SharePayload) => {
+      try {
+        await patchJson(client, `/ingest/documents/${id}/share`, payload);
+        setDocs((prev) =>
+          prev.map((d) =>
+            d.id === id
+              ? {
+                  ...d,
+                  allowed_roles: payload.allowed_roles,
+                  allowed_user_ids: payload.allowed_user_ids,
+                }
+              : d,
+          ),
+        );
+        toast("Sharing updated");
+      } catch (e) {
+        fail(e);
+        throw e;
+      }
+    },
+    [client, fail, toast],
+  );
+
   const ingestUrl = useCallback(
     async (url: string) => {
       try {
@@ -65,5 +89,5 @@ export function useDocuments() {
     [client, fail, refresh, toast],
   );
 
-  return { docs, loading, refresh, remove, ingestUrl, ingestFile };
+  return { docs, loading, refresh, remove, share, ingestUrl, ingestFile };
 }

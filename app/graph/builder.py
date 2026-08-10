@@ -39,7 +39,9 @@ class GraphBuilder:
         for doc in documents:
             prompt = EXTRACTION_PROMPT.format(text=doc.page_content)
             response = self.llm.invoke(prompt)
-            triples = self._parse_response(response.content)
+            from app.core.factories import message_text
+
+            triples = self._parse_response(message_text(response.content))
             all_triples.extend(triples)
         return all_triples
 

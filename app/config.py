@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     EMBEDDING_API_KEY: str = ""
     EMBEDDING_BASE_URL: str | None = None
 
+    # Multimodal (DashScope qwen3-vl-embedding) — image track, separate from text embeddings
+    DASHSCOPE_API_KEY: str = ""
+    VL_EMBEDDING_MODEL: str = "qwen3-vl-embedding"
+    VL_EMBEDDING_DIMENSION: int = 1024
+    VL_COLLECTION_NAME: str = "rag_images"
+    VL_CAPTION_MODEL: str = "qwen-vl-plus"  # vision LLM to describe images for grounded generation
+    IMAGE_RETRIEVAL_ENABLED: bool = False
+
     # Reranker
     RERANKER_PROVIDER: str = "cohere"
     RERANKER_MODEL: str = "rerank-v3.5"
@@ -78,8 +86,13 @@ class Settings(BaseSettings):
     # Data
     DATA_DIR: str = "./data"
 
-    # Security
+    # Security / Auth
     API_KEY_HASH: str = ""
+    AUTH_ENABLED: bool = False
+    JWT_SECRET: str = ""
+    JWT_EXPIRE_MINUTES: int = 60 * 24
+    BOOTSTRAP_ADMIN_USERNAME: str = ""
+    BOOTSTRAP_ADMIN_PASSWORD: str = ""
     CORS_ORIGINS: str = "*"
     MAX_FILE_SIZE_MB: int = 100
 
@@ -176,6 +189,14 @@ class Settings(BaseSettings):
             raise ValueError(f"AGENT_MAX_REWRITES must be >= 0, got {v}")
         return v
 
+    @field_validator("VL_EMBEDDING_DIMENSION")
+    @classmethod
+    def validate_vl_embedding_dimension(cls, v: int) -> int:
+        allowed = {2560, 2048, 1536, 1024, 768, 512, 256}
+        if v not in allowed:
+            raise ValueError(f"VL_EMBEDDING_DIMENSION must be one of {sorted(allowed)}, got {v}")
+        return v
+
     @model_validator(mode="after")
     def validate_api_keys(self) -> "Settings":
         if self.LLM_PROVIDER == "openai" and self.LLM_API_KEY == "":
@@ -184,6 +205,8 @@ class Settings(BaseSettings):
             raise ValueError("EMBEDDING_API_KEY required when EMBEDDING_PROVIDER='openai'")
         if self.RERANKER_PROVIDER == "cohere" and self.COHERE_API_KEY == "":
             raise ValueError("COHERE_API_KEY required when RERANKER_PROVIDER='cohere'")
+        if self.IMAGE_RETRIEVAL_ENABLED and not self.DASHSCOPE_API_KEY:
+            raise ValueError("DASHSCOPE_API_KEY required when IMAGE_RETRIEVAL_ENABLED=true")
         return self
 
 

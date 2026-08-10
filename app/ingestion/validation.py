@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-ALLOWED_SUFFIXES = {".pdf", ".md", ".markdown"}
+ALLOWED_SUFFIXES = {".pdf", ".md", ".markdown", ".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 def validate_source(source: str, settings) -> str:

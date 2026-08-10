@@ -8,7 +8,19 @@ from app.guardrails.service import apply_output, check_input
 from app.ingestion.validation import validate_source
 
 
+def _auth_blocks_mcp() -> dict | None:
+    """MCP has no per-user JWT context; refuse when AUTH_ENABLED to avoid ACL bypass."""
+    enabled = get_settings().AUTH_ENABLED
+    if enabled is True:
+        return {
+            "error": "MCP tools are disabled when AUTH_ENABLED=true; use the HTTP API with JWT",
+        }
+    return None
+
+
 def mcp_search(query: str, top_k: int = 5) -> dict:
+    if err := _auth_blocks_mcp():
+        return err
     blocked = check_input(query)
     if blocked:
         return {"error": "blocked by input guardrails", "patterns": blocked}
@@ -16,6 +28,8 @@ def mcp_search(query: str, top_k: int = 5) -> dict:
 
 
 def mcp_ask(question: str, top_k: int = 5) -> dict:
+    if err := _auth_blocks_mcp():
+        return err
     blocked = check_input(question)
     if blocked:
         return {"error": "blocked by input guardrails", "patterns": blocked}
@@ -27,6 +41,8 @@ def mcp_ask(question: str, top_k: int = 5) -> dict:
 
 
 def mcp_ingest(source: str) -> dict:
+    if err := _auth_blocks_mcp():
+        return err
     if not get_settings().MCP_ALLOW_INGEST:
         return {"error": "ingest is disabled (set MCP_ALLOW_INGEST=true)"}
     try:
@@ -37,4 +53,6 @@ def mcp_ingest(source: str) -> dict:
 
 
 def mcp_list_documents() -> list[dict]:
+    if err := _auth_blocks_mcp():
+        return err
     return list_documents()

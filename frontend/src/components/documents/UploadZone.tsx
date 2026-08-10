@@ -1,7 +1,7 @@
 import { UploadCloud } from "lucide-react";
 import { useRef, useState } from "react";
 
-const ALLOWED = [".pdf", ".md", ".markdown"];
+const ALLOWED = [".pdf", ".md", ".markdown", ".png", ".jpg", ".jpeg", ".webp"];
 
 function allowed(name: string): boolean {
   return ALLOWED.some((s) => name.toLowerCase().endsWith(s));
@@ -41,7 +41,7 @@ export function UploadZone({ onFile }: { onFile: (f: File) => void }) {
         }`}
       >
         <UploadCloud size={28} />
-        Drop a PDF or Markdown file here, or click to choose
+        Drop a PDF, Markdown, or image (PNG/JPG/WEBP) here, or click to choose
         <input
           ref={inputRef}
           data-testid="file-input"

@@ -15,6 +15,7 @@ _llm_cache: dict[tuple, object] = {}
 _embedder_cache: dict[tuple, object] = {}
 _reranker_cache: dict[tuple, object] = {}
 _vector_store_cache: dict[tuple, object] = {}
+_image_vector_store_cache: dict[tuple, object] = {}
 _keyword_store_cache: dict[tuple, object] = {}
 _graph_store_cache: dict[tuple, object] = {}
 
@@ -46,8 +47,41 @@ def get_llm(model: str | None = None):
     return instance
 
 
+def message_text(content) -> str:
+    """Normalize LLM message content to a plain string.
+
+    OpenAI-style models return ``str``; Anthropic (esp. with thinking) may
+    return a list of blocks ``[{"type":"thinking",...},{"type":"text","text":...}]``
+    or LangChain content-block objects. Callers that ``"".join`` tokens need text.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") in ("thinking", "redacted_thinking"):
+                    continue
+                text = block.get("text")
+                if text:
+                    parts.append(str(text))
+            else:
+                btype = getattr(block, "type", None)
+                if btype in ("thinking", "redacted_thinking"):
+                    continue
+                text = getattr(block, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
 def _content(resp) -> str:
-    return getattr(resp, "content", "") or ""
+    return message_text(getattr(resp, "content", None))
 
 
 def complete_with_model(prompt: str, *, fast: bool = False) -> tuple[str, str]:
@@ -80,11 +114,18 @@ def get_embedder():
     if key in _embedder_cache:
         return _embedder_cache[key]
     if settings.EMBEDDING_PROVIDER == "openai":
-        instance = OpenAIEmbeddings(
-            model=settings.EMBEDDING_MODEL,
-            api_key=settings.EMBEDDING_API_KEY or None,
-            base_url=settings.EMBEDDING_BASE_URL,
-        )
+        # Custom / OpenAI-compatible endpoints (e.g. DashScope) expect raw strings.
+        # Default check_embedding_ctx_length tokenizes via tiktoken and breaks them.
+        # DashScope also caps batch size at 10 texts per request.
+        kwargs = {
+            "model": settings.EMBEDDING_MODEL,
+            "api_key": settings.EMBEDDING_API_KEY or None,
+            "base_url": settings.EMBEDDING_BASE_URL,
+        }
+        if settings.EMBEDDING_BASE_URL:
+            kwargs["check_embedding_ctx_length"] = False
+            kwargs["chunk_size"] = 10
+        instance = OpenAIEmbeddings(**kwargs)
     else:
         raise ValueError(f"Unsupported embedding provider: {settings.EMBEDDING_PROVIDER}")
     _embedder_cache[key] = instance
@@ -125,6 +166,29 @@ def get_vector_store():
     return _vector_store_cache[key]
 
 
+def get_image_vector_store():
+    """Cached ImageVectorStore for the qwen3-vl-embedding dual track."""
+    from app.retrieval.image_vector_store import ImageVectorStore
+
+    settings = get_settings()
+    key = (settings.QDRANT_URL, settings.VL_COLLECTION_NAME, settings.VL_EMBEDDING_DIMENSION)
+    if key not in _image_vector_store_cache:
+        _image_vector_store_cache[key] = ImageVectorStore()
+        logger.info(
+            "Created image vector store: url=%s collection=%s dim=%s",
+            key[0],
+            key[1],
+            key[2],
+        )
+    return _image_vector_store_cache[key]
+
+
+def image_retrieval_ready() -> bool:
+    """True when image track is enabled and DashScope credentials are present."""
+    settings = get_settings()
+    return bool(settings.IMAGE_RETRIEVAL_ENABLED and settings.DASHSCOPE_API_KEY)
+
+
 def get_keyword_store():
     """Cached keyword store: local BM25 (default) or OpenSearch, per KEYWORD_BACKEND."""
     settings = get_settings()
@@ -159,5 +223,6 @@ def clear_caches() -> None:
     _embedder_cache.clear()
     _reranker_cache.clear()
     _vector_store_cache.clear()
+    _image_vector_store_cache.clear()
     _keyword_store_cache.clear()
     _graph_store_cache.clear()
